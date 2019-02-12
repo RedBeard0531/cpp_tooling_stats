@@ -410,25 +410,42 @@ class Test(Main):
             if self.args.use_std:
                 ninja.variable('STDLIB', '-I "%s"' % os.path.join(self.dir, '..', 'std-modules'))
             ninja.variable('CXXFLAGS', '-fmodules-ts -c -std=c++2a -O0 $STDLIB')
+            ninja.variable('dir', dir)
 
             if self.args.toolset == 'gcc':
                 two_phase = False
-                ninja.variable('MAPFLAG', '-fmodule-mapper="{dir}/mm.csv"'.format(dir=dir))
+                ninja.variable('CXXFLAGS', '$CXXFLAGS -fdiagnostics-color -fmodule-mapper="$dir/mm.csv"')
+                ninja.variable('BMI', 'gcm')
                 ninja.rule('CXX',
-                           command='"{cxx}" $CXXFLAGS $MAPFLAG -x c++ $in -o $out'.format(
+                           command='"{cxx}" $CXXFLAGS -x c++ $in -o $out'.format(
                                cxx=self.cxx),
                            description='CXX $out')
             elif self.args.toolset == 'clang':
                 two_phase = True
-                ninja.variable('MAPFLAG', '"@{dir}/mm.txt"'.format(dir=dir))
+                ninja.variable('CXXFLAGS', '$CXXFLAGS -fcolor-diagnostics "@$dir/mm.txt"')
+                ninja.variable('BMI', 'pcm')
                 ninja.rule('CXX',
-                           command='"{cxx}" $CXXFLAGS $MAPFLAG $in -o $out'.format(
+                           command='"{cxx}" $CXXFLAGS $in -o $out'.format(
                                cxx=self.cxx),
                            description='CXX $out')
                 ninja.rule('CXX-BMI',
-                           command='"{cxx}" $CXXFLAGS $MAPFLAG -x c++-module --precompile $in -o $out'.format(
+                           command='"{cxx}" $CXXFLAGS -x c++-module --precompile $in -o $out'.format(
                                cxx=self.cxx),
                            description='CXX-BMI $out')
+
+            ninja.rule('DEPS',
+                       # TODO replace rg with a call to the compiler to get the deps
+                       command="echo 'build __deps_$in: phony $$' > $out; rg 'import\s+(.*)\s*;' $in --replace '  $dir/$$1.$BMI $$' >> $out; echo >> $out",
+                       description='DEPS $in')
+
+            ninja.rule('ALL_DEPS',
+                       # tr is to work around the ninja limitation that bans newlines in variables.
+                       # TODO only append these in the 'bootstrap' phase.
+                       command="cat $out.rsp | tr '\\t' '\\n' >> $out; echo >> $out",
+                       rspfile="$out.rsp",
+                       rspfile_content="$all_deps",
+                       description='ALL_DEPS')
+
 
             dag_deps = {}
             for dag_level in dag_levels:
@@ -453,24 +470,31 @@ class Test(Main):
                             [str(d)+'-pre' for d in m['deps']+[str(m["index"])]])
 
             module_map = {}
+            ninja_fragments=[]
             for n in range(int(self.args.count)):
                 module_id = 'm%s' % (n)
                 module_mxx = os.path.join(dir, module_id + '.mpp')
                 module_obj = os.path.join(dir, module_id + '.o')
+                module_ninja = os.path.join(dir, module_id + '.ninja')
                 module_bmi = None
                 module_deps = ['m%s' % (n) for n in dag_deps[n]]
                 module_source = self.__make_module_source__(
                     module_id, module_deps)
+
+                ninja_fragments.append(module_ninja)
+                ninja.variable('all_deps', '$all_deps\tinclude '+module_ninja)
+                ninja.build(module_ninja, 'DEPS', module_mxx)
+
                 if self.args.toolset == 'gcc':
                     module_bmi = os.path.join(dir, module_id + '.gcm')
                     ninja.build(module_obj, 'CXX', module_mxx,
                                 implicit_outputs=module_bmi,
-                                implicit=[os.path.join(dir, dep + '.gcm') for dep in module_deps])
+                                implicit='__deps_'+module_mxx)
                 elif self.args.toolset == 'clang':
                     module_bmi = os.path.join(dir, module_id + '.pcm')
                     ninja.build(module_obj, 'CXX', module_bmi)
                     ninja.build(module_bmi, 'CXX-BMI', module_mxx,
-                                implicit=[os.path.join(dir, dep + '.pcm') for dep in module_deps])
+                                implicit='__deps_'+module_mxx)
                 ninja.default(module_obj)
                 module_map[module_id] = module_bmi
                 if self.args.debug:
@@ -481,6 +505,7 @@ class Test(Main):
                     with open(module_mxx, 'w') as f:
                         f.write(module_source)
 
+            ninja.build('$dir/build.ninja', 'ALL_DEPS', implicit=ninja_fragments)
             ninja_file.close()
 
             if self.args.debug:
